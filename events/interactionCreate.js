@@ -1,305 +1,601 @@
-const { ModalBuilder, TextInputBuilder, ActionRowBuilder, TextInputStyle, EmbedBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
-const { createCase, updateCaseStatus, addCaseAction } = require('../database');
+const {
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  ContainerBuilder,
+  LabelBuilder,
+  MessageFlags,
+  ModalBuilder,
+  SectionBuilder,
+  SeparatorBuilder,
+  SeparatorSpacingSize,
+  StringSelectMenuBuilder,
+  ThumbnailBuilder,
+  TextDisplayBuilder,
+  TextInputBuilder,
+  TextInputStyle,
+} = require('discord.js');
+const db = require('../db.js');
+
+const COMPONENTS_V2 = MessageFlags.IsComponentsV2;
+const EPHEMERAL_V2 = MessageFlags.Ephemeral | COMPONENTS_V2;
+const STAFF_ROLE_ID = '1508910962130948237';
+
+function createContainer(color, sections, actionRow) {
+  const container = new ContainerBuilder().setAccentColor(color);
+
+  for (const section of sections) {
+    container.addTextDisplayComponents(
+      new TextDisplayBuilder().setContent(section),
+    );
+  }
+
+  if (actionRow) {
+    container.addActionRowComponents(actionRow);
+  }
+
+  return container;
+}
+
+async function getCaseNumber(caseData) {
+  const result = await db.knex('cases')
+    .where(function whereEarlierCases() {
+      this.where('created_at', '<', caseData.created_at)
+        .orWhere(function whereEarlierIdsAtSameTime() {
+          this.where('created_at', caseData.created_at)
+            .andWhere('id', '<=', caseData.id);
+        });
+    })
+    .count('* as case_number')
+    .first();
+
+  return Number(result.case_number);
+}
+
+function createCaseContainer(caseData, heading, color, options = {}) {
+  const container = new ContainerBuilder().setAccentColor(color);
+  const header = new SectionBuilder()
+    .addTextDisplayComponents(
+      new TextDisplayBuilder().setContent(
+        `${options.staffMention ? `<@&${STAFF_ROLE_ID}>\n` : ''}### Case #${caseData.case_number ?? caseData.id} - ${heading}\n**Opened by:** <@${caseData.user_id}>`,
+      ),
+    )
+    .setThumbnailAccessory(
+      new ThumbnailBuilder()
+        .setURL(options.openerAvatarUrl)
+        .setDescription(`Avatar of case opener ${caseData.user_id}`),
+    );
+
+  container
+    .addSectionComponents(header)
+    .addSeparatorComponents(
+      new SeparatorBuilder().setSpacing(SeparatorSpacingSize.Small),
+    )
+    .addTextDisplayComponents(
+      new TextDisplayBuilder().setContent([
+        `**Type of Punishment:** ${caseData.type_of_punishment}`,
+        `**${caseData.account_type || 'Roblox'} Username:** ${caseData.account_username || caseData.roblox_username || 'Not provided'}`,
+        `**Reason:**\n${caseData.reason_for_punishment}`,
+        `**Appeal Text:**\n${caseData.appeal_text}`,
+        `**Status:** ${options.status || heading}`,
+        options.handledBy && `**Handled by:** ${options.handledBy}`,
+        options.staffReason && `**Staff Comments:**\n${options.staffReason}`,
+      ].filter(Boolean).join('\n\n')),
+    )
+    .addSeparatorComponents(
+      new SeparatorBuilder().setSpacing(SeparatorSpacingSize.Small),
+    );
+
+  if (options.actionRow) {
+    container
+      .addActionRowComponents(options.actionRow)
+      .addSeparatorComponents(
+        new SeparatorBuilder().setSpacing(SeparatorSpacingSize.Small),
+      );
+  }
+
+  return container.addTextDisplayComponents(
+    new TextDisplayBuilder().setContent(
+      `**${options.botUsername}** • Case ID: \`${caseData.id}\``,
+    ),
+  );
+}
+
+const APPEAL_BUTTON_CATEGORIES = {
+  hcdf_appeal: 'hcdf',
+  rsf_appeal: 'rsf',
+  discord_appeal: 'discord',
+  game_appeal: 'game',
+};
+
+function getPunishmentChoices(category) {
+  const choicesByCategory = {
+    hcdf: ['Strike', 'Blacklist', 'Warn'],
+    hecdf: ['Strike', 'Blacklist', 'Warn'],
+    rsf: ['Blacklist', 'Strike', 'Warn'],
+    discord: ['Ban', 'Mute', 'Strike', 'Warn'],
+    game: ['Ban', 'Combat Restriction', 'Warn'],
+    legacy: ['Ban', 'Warn', 'Mute', 'Strike'],
+  };
+
+  return choicesByCategory[category] || [];
+}
+
+function createAppealModal(category) {
+  const punishmentSelect = new StringSelectMenuBuilder()
+    .setCustomId('punishment_type')
+    .setPlaceholder('Choose the punishment to appeal')
+    .addOptions(
+      getPunishmentChoices(category).map((choice) => ({
+        label: choice,
+        value: choice,
+      })),
+    );
+
+  return new ModalBuilder()
+    .setCustomId(`appeal_modal:${category}`)
+    .setTitle('Appeal Form')
+    .addLabelComponents(
+      new LabelBuilder()
+        .setLabel('Type of Punishment')
+        .setStringSelectMenuComponent(punishmentSelect),
+      new LabelBuilder()
+        .setLabel(getAccountUsernameLabel(category))
+        .setTextInputComponent(
+          createModalTextInput(
+            'account_username',
+            null,
+            TextInputStyle.Short,
+            getAccountUsernameMaxLength(category),
+          ).setMinLength(getAccountUsernameMinLength(category)),
+        ),
+      new LabelBuilder()
+        .setLabel('Reason for Punishment')
+        .setTextInputComponent(
+          createModalTextInput(
+            'punishment_reason',
+            null,
+            TextInputStyle.Paragraph,
+            1200,
+          ),
+        ),
+      new LabelBuilder()
+        .setLabel('Your Appeal')
+        .setTextInputComponent(
+          createModalTextInput(
+            'appeal_text',
+            null,
+            TextInputStyle.Paragraph,
+            1800,
+          ),
+        ),
+    );
+}
+
+function getAccountUsernameType(category) {
+  return ['hcdf', 'hecdf', 'rsf', 'discord'].includes(category)
+    ? 'Discord'
+    : 'Roblox';
+}
+
+function getAccountUsernameLabel(category) {
+  return `${getAccountUsernameType(category)} Username`;
+}
+
+function getAccountUsernameMinLength(category) {
+  return getAccountUsernameType(category) === 'Discord' ? 2 : 3;
+}
+
+function getAccountUsernameMaxLength(category) {
+  return getAccountUsernameType(category) === 'Discord' ? 32 : 20;
+}
+
+function createModalTextInput(customId, label, style, maxLength) {
+  const input = new TextInputBuilder()
+    .setCustomId(customId)
+    .setStyle(style)
+    .setMaxLength(maxLength)
+    .setRequired(true);
+
+  if (label) {
+    input.setLabel(label);
+  }
+
+  return input;
+}
 
 module.exports = {
   name: 'interactionCreate',
   async execute(interaction) {
-    // Handle button interactions
     if (interaction.isButton()) {
-      if (interaction.customId === 'appeal_button') {
-        const modal = new ModalBuilder()
-          .setCustomId('appeal_modal')
-          .setTitle('Appeal Form');
+      const buttonCategory = APPEAL_BUTTON_CATEGORIES[interaction.customId];
+      if (
+        interaction.customId === 'appeal_button' ||
+        interaction.customId.startsWith('appeal_button:') ||
+        buttonCategory
+      ) {
+        const category = buttonCategory || interaction.customId.split(':')[1] || 'legacy';
+        if (!getPunishmentChoices(category).length) {
+          await interaction.reply({
+            components: [
+              createContainer(0xFF0000, [
+                '# Appeal Unavailable',
+                'This appeal category is not configured.',
+              ]),
+            ],
+            flags: EPHEMERAL_V2,
+          });
+          return;
+        }
 
-        const punishmentInput = new TextInputBuilder()
-          .setCustomId('punishment_type')
-          .setLabel('Type of Punishment')
-          .setStyle(TextInputStyle.Short)
-          .setRequired(true);
-
-        const reasonInput = new TextInputBuilder()
-          .setCustomId('punishment_reason')
-          .setLabel('Reason for Punishment')
-          .setStyle(TextInputStyle.Paragraph)
-          .setRequired(true);
-
-        const appealInput = new TextInputBuilder()
-          .setCustomId('appeal_text')
-          .setLabel('Your Appeal')
-          .setStyle(TextInputStyle.Paragraph)
-          .setRequired(true);
-
-        const row1 = new ActionRowBuilder().addComponents(punishmentInput);
-        const row2 = new ActionRowBuilder().addComponents(reasonInput);
-        const row3 = new ActionRowBuilder().addComponents(appealInput);
-
-        modal.addComponents(row1, row2, row3);
-        await interaction.showModal(modal);
+        await interaction.showModal(createAppealModal(category));
         return;
       }
 
-      // Case action buttons
       if (interaction.customId.startsWith('case_')) {
-        const [_, action, caseId] = interaction.customId.split('_');
+        const [, action, ...caseIdParts] = interaction.customId.split('_');
+        const caseId = caseIdParts.join('_');
 
         if (action === 'accept' || action === 'deny') {
           const reasonModal = new ModalBuilder()
             .setCustomId(`case_reason_${action}_${caseId}`)
-            .setTitle(`${action.charAt(0).toUpperCase() + action.slice(1)} Case`);
+            .setTitle(`${action === 'accept' ? 'Accept' : 'Deny'} Case`)
+            .addComponents(
+              new ActionRowBuilder().addComponents(
+                createModalTextInput(
+                  'case_action_reason',
+                  `Reason for ${action}`,
+                  TextInputStyle.Paragraph,
+                  1500,
+                ),
+              ),
+            );
 
-          const reasonInput = new TextInputBuilder()
-            .setCustomId('case_action_reason')
-            .setLabel(`Reason for ${action.charAt(0).toUpperCase() + action.slice(1)}`)
-            .setStyle(TextInputStyle.Paragraph)
-            .setRequired(true);
-
-          const row = new ActionRowBuilder().addComponents(reasonInput);
-          reasonModal.addComponents(row);
           await interaction.showModal(reasonModal);
           return;
-        } else if (action === 'claim') {
-          await interaction.deferReply({ ephemeral: true });
+        }
+
+        if (action === 'claim') {
+          await interaction.deferReply({ flags: EPHEMERAL_V2 });
 
           try {
-            const db = require('../database');
-            
-            console.log(`[CLAIM] Processing claim for case ${caseId}`);
-            db.addCaseAction(caseId, 'claim', interaction.user.id, null);
-            db.db.prepare('UPDATE cases SET status = ? WHERE id = ?').run('claimed', caseId);
+            await db.applyCaseAction(caseId, 'claim', interaction.user.id, null);
+            const caseData = await db.getCase(caseId);
 
-            // Get case data
-            const caseData = db.getCase(caseId);
-            console.log(`[CLAIM] Case data retrieved:`, JSON.stringify(caseData, null, 2));
-            console.log(`[CLAIM] User ID to DM: ${caseData.user_id}`);
+            if (!caseData) {
+              throw new Error(`Case ${caseId} was not found after claiming.`);
+            }
+            const caseNumber = await getCaseNumber(caseData);
 
-            // Notify user via DM
-            if (!caseData.user_id) {
-              console.error('[CLAIM] No user_id found in case data!');
-            } else {
+            let caseUser;
+            let openerAvatarUrl = interaction.client.user.defaultAvatarURL;
+            try {
+              caseUser = await interaction.client.users.fetch(caseData.user_id);
+              openerAvatarUrl = caseUser.displayAvatarURL({ size: 256 });
+            } catch (error) {
+              console.error(`[CLAIM] Could not fetch case opener ${caseData.user_id}:`, error);
+            }
+
+            if (caseUser) {
               try {
-                console.log(`[CLAIM] Attempting to fetch user ${caseData.user_id}...`);
-                const user = await interaction.client.users.fetch(caseData.user_id).catch(err => {
-                  console.error(`[CLAIM] Failed to fetch user:`, err.message);
-                  throw err;
-                });
-                console.log(`[CLAIM] User fetched successfully: ${user.tag} (${user.id})`);
+              const notification = createContainer(0x0099FF, [
+                `### Case ${caseId} - Claimed`,
+                `Your case has been claimed by **${interaction.user.username}** and is being reviewed.`,
+              ]);
 
-                const botAvatar = interaction.client.user.avatarURL({ size: 4096 }) || interaction.client.user.defaultAvatarURL;
-                console.log(`[CLAIM] Bot avatar URL: ${botAvatar}`);
-
-                const notificationEmbed = new EmbedBuilder()
-                  .setColor(0x0099FF)
-                  .setTitle(`Case ${caseId} - Claimed`)
-                  .setDescription(`Your case has been claimed by **${interaction.user.username}** and is being reviewed.`)
-                  .setFooter({ text: 'FSGPD Appeals Bot', iconURL: botAvatar });
-
-                console.log(`[CLAIM] Sending DM to ${user.id}...`);
-                await user.send({ embeds: [notificationEmbed] }).catch(err => {
-                  console.error(`[CLAIM] Failed to send DM:`, err.message);
-                  throw err;
-                });
-                console.log(`[CLAIM] ✅ DM sent successfully to user ${user.id}`);
-              } catch (err) {
-                console.error(`[CLAIM] ❌ Error in DM process for user ${caseData.user_id}:`, err.message);
-                console.error(`[CLAIM] Full error:`, err);
+              await caseUser.send({
+                components: [notification],
+                flags: COMPONENTS_V2,
+              });
+              } catch (error) {
+                console.error(`[CLAIM] Could not notify user ${caseData.user_id}:`, error);
               }
             }
 
-            // Update the case embed in the log channel
             if (caseData.message_id && caseData.channel_id) {
               try {
-                console.log(`[CLAIM] Fetching channel ${caseData.channel_id}`);
-                const caseLogChannel = await interaction.client.channels.fetch(caseData.channel_id);
-                console.log(`[CLAIM] Fetching message ${caseData.message_id}`);
-                const caseMessage = await caseLogChannel.messages.fetch(caseData.message_id);
-                
-                const updatedEmbed = new EmbedBuilder()
-                  .setColor(0x0099FF)
-                  .setTitle(`${caseId} - Claimed`)
-                  .setDescription(`**User:** <@${caseData.user_id}>\n**Type of Punishment:** ${caseData.type_of_punishment}\n**Reason:** ${caseData.reason_for_punishment}\n**Appeal Text:** ${caseData.appeal_text}\n\n**Status:** Claimed by ${interaction.user.username}`)
-                  .setFooter({ text: 'FSGPD Appeals Bot', iconURL: interaction.client.user.avatarURL() })
-                  .setTimestamp();
-
-                // Create Accept and Deny buttons for the claimed case
-                const acceptBtn = new ButtonBuilder()
+                const caseLogChannel = await interaction.client.channels.fetch(
+                  caseData.channel_id,
+                );
+                const caseMessage = await caseLogChannel.messages.fetch(
+                  caseData.message_id,
+                );
+                const acceptButton = new ButtonBuilder()
                   .setCustomId(`case_accept_${caseId}`)
                   .setLabel('Accept')
                   .setStyle(ButtonStyle.Success);
-
-                const denyBtn = new ButtonBuilder()
+                const denyButton = new ButtonBuilder()
                   .setCustomId(`case_deny_${caseId}`)
                   .setLabel('Deny')
                   .setStyle(ButtonStyle.Danger);
+                const row = new ActionRowBuilder().addComponents(
+                  acceptButton,
+                  denyButton,
+                );
+                const container = createCaseContainer(
+                  { ...caseData, case_number: caseNumber },
+                  'Claimed',
+                  0x0099FF,
+                  {
+                    status: `Claimed by ${interaction.user.username}`,
+                    actionRow: row,
+                    openerAvatarUrl,
+                    botUsername: interaction.client.user.username,
+                  },
+                );
 
-                const row = new ActionRowBuilder().addComponents(acceptBtn, denyBtn);
-
-                await caseMessage.edit({ embeds: [updatedEmbed], components: [row] });
-                console.log(`[CLAIM] Case message updated successfully with Accept/Deny buttons`);
-              } catch (err) {
-                console.error(`[CLAIM] Could not update case message for ${caseId}:`, err.message);
+                await caseMessage.edit({
+                  embeds: [],
+                  components: [container],
+                  flags: COMPONENTS_V2,
+                });
+              } catch (error) {
+                console.error(`[CLAIM] Could not update case message ${caseId}:`, error);
               }
             }
 
-            await interaction.editReply({ content: `Case ${caseId} claimed by <@${interaction.user.id}>` });
+            await interaction.editReply({
+              components: [
+                createContainer(0x0099FF, [
+                  `### Case ${caseId} claimed`,
+                  `Claimed by <@${interaction.user.id}>.`,
+                ]),
+              ],
+              flags: COMPONENTS_V2,
+            });
           } catch (error) {
             console.error('[CLAIM] Error claiming case:', error);
-            await interaction.editReply({ content: 'An error occurred while claiming the case.' });
+            await interaction.editReply({
+              components: [
+                createContainer(0xFF0000, [
+                  `### Claim Failed`,
+                  `An error occurred while claiming the case.`,
+                ]),
+              ],
+              flags: COMPONENTS_V2,
+            });
           }
         }
       }
+
       return;
     }
 
-    // Handle modal submissions
-    if (interaction.isModalSubmit()) {
-      if (interaction.customId === 'appeal_modal') {
-        try {
-          await interaction.deferReply({ ephemeral: true });
-
-          const punishmentType = interaction.fields.getTextInputValue('punishment_type');
-          const punishmentReason = interaction.fields.getTextInputValue('punishment_reason');
-          const appealText = interaction.fields.getTextInputValue('appeal_text');
-
-          // Create case in database
-          const caseId = createCase(interaction.user.id, punishmentType, punishmentReason, appealText);
-
-          const caseLogChannelId = process.env.CASE_LOG_CHANNEL_ID;
-          const caseLogChannel = await interaction.client.channels.fetch(caseLogChannelId);
-
-          if (!caseLogChannel) {
-            await interaction.editReply({ content: 'Error: Case log channel not found.' });
-            return;
-          }
-
-          // Create case log embed
-          const caseEmbed = new EmbedBuilder()
-            .setColor(0xFFAA00)
-            .setTitle(`${caseId} - New Appeal`)
-            .setDescription(`**User:** <@${interaction.user.id}>\n**Type of Punishment:** ${punishmentType}\n**Reason:** ${punishmentReason}\n**Appeal Text:** ${appealText}`)
-            .setFooter({ text: 'FSGPD Appeals Bot', iconURL: interaction.client.user.avatarURL() })
-            .setTimestamp();
-
-          // Create case action buttons
-          const acceptBtn = new ButtonBuilder()
-            .setCustomId(`case_accept_${caseId}`)
-            .setLabel('Accept')
-            .setStyle(ButtonStyle.Success);
-
-          const denyBtn = new ButtonBuilder()
-            .setCustomId(`case_deny_${caseId}`)
-            .setLabel('Deny')
-            .setStyle(ButtonStyle.Danger);
-
-          const claimBtn = new ButtonBuilder()
-            .setCustomId(`case_claim_${caseId}`)
-            .setLabel('Claim')
-            .setStyle(ButtonStyle.Primary);
-
-          const row = new ActionRowBuilder().addComponents(acceptBtn, denyBtn, claimBtn);
-
-          const caseLogMessage = await caseLogChannel.send({ embeds: [caseEmbed], components: [row] });
-
-          // Update case with message info
-          updateCaseStatus(caseId, 'logged', caseLogMessage.id, caseLogChannelId);
-
-          // Confirm to user
-          const confirmEmbed = new EmbedBuilder()
-            .setColor(0x00FF00)
-            .setTitle('✅ Appeal Submitted')
-            .setDescription(`Your appeal has been submitted successfully!\n\n**Case ID:** ${caseId}\n\nYou will be notified when your case is reviewed.`)
-            .setFooter({ text: 'FSGPD Appeals Bot', iconURL: interaction.client.user.avatarURL() });
-
-          await interaction.editReply({ embeds: [confirmEmbed] });
-        } catch (error) {
-          console.error('Error processing appeal:', error);
-          await interaction.editReply({ content: 'An error occurred while processing your appeal.' });
-        }
-        return;
-      }
-
-      // Handle case action reasons
-      if (interaction.customId.startsWith('case_reason_')) {
-        try {
-          await interaction.deferReply({ ephemeral: true });
-
-          const parts = interaction.customId.split('_');
-          const action = parts[2]; // accept or deny
-          const caseId = parts.slice(3).join('_');
-          const reason = interaction.fields.getTextInputValue('case_action_reason');
-
-          console.log(`[ACTION] Processing ${action} for case ${caseId}`);
-
-          const db = require('../database');
-          db.addCaseAction(caseId, action, interaction.user.id, reason);
-          db.db.prepare('UPDATE cases SET status = ? WHERE id = ?').run(action, caseId);
-
-          // Get the case details
-          const caseData = db.getCase(caseId);
-          console.log(`[ACTION] Case data retrieved:`, JSON.stringify(caseData, null, 2));
-
-          if (!caseData.user_id) {
-            console.error(`[ACTION] No user_id found in case data!`);
-            await interaction.editReply({ content: 'Error: Could not find user in case data.' });
-            return;
-          }
-
-          console.log(`[ACTION] Attempting to fetch user ${caseData.user_id}...`);
-          let user;
-          try {
-            user = await interaction.client.users.fetch(caseData.user_id);
-            console.log(`[ACTION] User fetched: ${user.tag}`);
-          } catch (err) {
-            console.error(`[ACTION] Failed to fetch user:`, err.message);
-            await interaction.editReply({ content: `Error: Could not fetch user ${caseData.user_id}` });
-            return;
-          }
-
-          // Notify user of case action
-          const botAvatar = interaction.client.user.avatarURL({ size: 4096 }) || interaction.client.user.defaultAvatarURL;
-          const notificationEmbed = new EmbedBuilder()
-            .setColor(action === 'accept' ? 0x00FF00 : 0xFF0000)
-            .setTitle(`Case ${caseId} - ${action.charAt(0).toUpperCase() + action.slice(1)}ed`)
-            .setDescription(`**Handled by:** ${interaction.user.username}\n\n**Staff Comments:**\n\`\`\`\n${reason}\n\`\`\``)
-            .setFooter({ text: 'FSGPD Appeals Bot', iconURL: botAvatar });
-
-          try {
-            console.log(`[ACTION] Sending DM to user ${user.id}...`);
-            await user.send({ embeds: [notificationEmbed] });
-            console.log(`[ACTION] ✅ DM sent successfully to ${user.id}`);
-          } catch (err) {
-            console.error(`[ACTION] ❌ Could not send DM to user ${caseData.user_id}:`, err.message);
-          }
-
-          // Update the case embed in the log channel
-          if (caseData.message_id && caseData.channel_id) {
-            try {
-              const caseLogChannel = await interaction.client.channels.fetch(caseData.channel_id);
-              const caseMessage = await caseLogChannel.messages.fetch(caseData.message_id);
-              
-              const statusColor = action === 'accept' ? 0x00FF00 : 0xFF0000;
-              const statusText = action === 'accept' ? 'Accepted' : 'Denied';
-              
-              const updatedEmbed = new EmbedBuilder()
-                .setColor(statusColor)
-                .setTitle(`${caseId} - ${statusText}`)
-                .setDescription(`**User:** <@${caseData.user_id}>\n**Type of Punishment:** ${caseData.type_of_punishment}\n**Reason:** ${caseData.reason_for_punishment}\n**Appeal Text:** ${caseData.appeal_text}\n\n**Status:** ${statusText}\n**Handled by:** ${interaction.user.username}\n**Staff Comments:**\n\`\`\`\n${reason}\n\`\`\``)
-                .setFooter({ text: 'FSGPD Appeals Bot', iconURL: interaction.client.user.avatarURL() })
-                .setTimestamp();
-
-              await caseMessage.edit({ embeds: [updatedEmbed], components: [] });
-              console.log(`[ACTION] Case ${caseId} message updated with ${action} status`);
-            } catch (err) {
-              console.error(`[ACTION] Could not update case message for ${caseId}:`, err.message);
-            }
-          }
-
-          await interaction.editReply({ content: `Case ${caseId} has been ${action}ed.` });
-        } catch (error) {
-          console.error('Error handling case action:', error);
-          await interaction.editReply({ content: 'An error occurred while processing the case action.' });
-        }
-        return;
-      }
+    if (!interaction.isModalSubmit()) {
+      return;
     }
-  }
+
+    if (interaction.customId.startsWith('appeal_modal:')) {
+      await interaction.deferReply({ flags: EPHEMERAL_V2 });
+
+      try {
+        const category = interaction.customId.split(':')[1];
+        const punishmentType = interaction.fields.getStringSelectValues('punishment_type')[0];
+        if (!getPunishmentChoices(category).includes(punishmentType)) {
+          throw new Error(`Invalid punishment type "${punishmentType}" for category "${category}".`);
+        }
+        const accountUsername = interaction.fields.getTextInputValue('account_username').trim();
+        const accountUsernameType = getAccountUsernameType(category);
+        const validUsername = accountUsernameType === 'Discord'
+          ? accountUsername.length >= 2 && accountUsername.length <= 32
+          : /^[A-Za-z0-9_]{3,20}$/.test(accountUsername);
+        if (!validUsername) {
+          throw new Error(`INVALID_${accountUsernameType.toUpperCase()}_USERNAME`);
+        }
+        const punishmentReason = interaction.fields.getTextInputValue('punishment_reason');
+        const appealText = interaction.fields.getTextInputValue('appeal_text');
+        const newCase = await db.createCase(
+          interaction.user.id,
+          punishmentType,
+          punishmentReason,
+          appealText,
+          accountUsername,
+          accountUsernameType,
+        );
+        const caseId = typeof newCase === 'string' ? newCase : newCase.id;
+        const caseData = await db.getCase(caseId);
+        if (!caseData) {
+          throw new Error(`Case ${caseId} was not found after creation.`);
+        }
+        const caseNumber = await getCaseNumber(caseData);
+
+        const caseLogChannelId = process.env.CASE_LOG_CHANNEL_ID;
+        if (!caseLogChannelId) {
+          throw new Error('CASE_LOG_CHANNEL_ID is not configured.');
+        }
+
+        const caseLogChannel = await interaction.client.channels.fetch(caseLogChannelId);
+        if (!caseLogChannel) {
+          throw new Error(`Case log channel ${caseLogChannelId} was not found.`);
+        }
+
+        const acceptButton = new ButtonBuilder()
+          .setCustomId(`case_accept_${caseId}`)
+          .setLabel('Accept')
+          .setStyle(ButtonStyle.Success);
+        const denyButton = new ButtonBuilder()
+          .setCustomId(`case_deny_${caseId}`)
+          .setLabel('Deny')
+          .setStyle(ButtonStyle.Danger);
+        const claimButton = new ButtonBuilder()
+          .setCustomId(`case_claim_${caseId}`)
+          .setLabel('Claim')
+          .setStyle(ButtonStyle.Primary);
+        const row = new ActionRowBuilder().addComponents(
+          acceptButton,
+          denyButton,
+          claimButton,
+        );
+        const caseLogMessage = await caseLogChannel.send({
+          components: [
+            createCaseContainer(
+              {
+                id: caseId,
+                case_number: caseNumber,
+                user_id: interaction.user.id,
+                type_of_punishment: punishmentType,
+                account_username: accountUsername,
+                account_type: accountUsernameType,
+                reason_for_punishment: punishmentReason,
+                appeal_text: appealText,
+              },
+              'New Appeal',
+              0xFFAA00,
+              {
+                status: 'Pending',
+                actionRow: row,
+                openerAvatarUrl: interaction.user.displayAvatarURL({ size: 256 }),
+                botUsername: interaction.client.user.username,
+                staffMention: true,
+              },
+            ),
+          ],
+          flags: COMPONENTS_V2,
+          allowedMentions: {
+            roles: [STAFF_ROLE_ID],
+            users: [],
+          },
+        });
+
+        await db.updateCaseStatus(
+          caseId,
+          'logged',
+          caseLogMessage.id,
+          caseLogChannelId,
+        );
+
+        await interaction.editReply({
+          components: [
+            createContainer(0x00FF00, [
+              `### Appeal Submitted`,
+              `Your appeal has been submitted successfully.\n\n**Case ID:** ${caseId}\n\nYou will be notified when your case is reviewed.`,
+            ]),
+          ],
+          flags: COMPONENTS_V2,
+        });
+      } catch (error) {
+        console.error('Error processing appeal:', error);
+        await interaction.editReply({
+          components: [
+            createContainer(0xFF0000, [
+              `### Appeal Submission Failed`,
+              error.message === 'INVALID_DISCORD_USERNAME'
+                ? 'Enter a Discord username between 2 and 32 characters.'
+                : error.message === 'INVALID_ROBLOX_USERNAME'
+                  ? 'Enter a valid Roblox username (3-20 letters, numbers, or underscores).'
+                  : error.message.includes('DATABASE_URL')
+                    ? 'Appeal submissions are temporarily unavailable because the database is not configured. Please contact staff.'
+                    : 'An error occurred while processing your appeal.',
+            ]),
+          ],
+          flags: COMPONENTS_V2,
+        });
+      }
+
+      return;
+    }
+
+    if (!interaction.customId.startsWith('case_reason_')) {
+      return;
+    }
+
+    await interaction.deferReply({ flags: EPHEMERAL_V2 });
+
+    try {
+      const [, , action, ...caseIdParts] = interaction.customId.split('_');
+      const caseId = caseIdParts.join('_');
+      const reason = interaction.fields.getTextInputValue('case_action_reason');
+
+      if (action !== 'accept' && action !== 'deny') {
+        throw new Error(`Unsupported case action: ${action}`);
+      }
+
+      await db.applyCaseAction(caseId, action, interaction.user.id, reason);
+      const caseData = await db.getCase(caseId);
+
+      if (!caseData) {
+        throw new Error(`Case ${caseId} was not found after the action.`);
+      }
+
+      const statusText = action === 'accept' ? 'Accepted' : 'Denied';
+      const color = action === 'accept' ? 0x00FF00 : 0xFF0000;
+      let caseUser;
+      let openerAvatarUrl = interaction.client.user.defaultAvatarURL;
+
+      try {
+        caseUser = await interaction.client.users.fetch(caseData.user_id);
+        openerAvatarUrl = caseUser.displayAvatarURL({ size: 256 });
+      } catch (error) {
+        console.error(`[ACTION] Could not fetch case opener ${caseData.user_id}:`, error);
+      }
+
+      if (caseUser) {
+        try {
+          await caseUser.send({
+          components: [
+            createContainer(color, [
+              `### Case ${caseId} - ${statusText}`,
+              `**Handled by:** ${interaction.user.username}`,
+              `**Staff Comments:**\n${reason}`,
+            ]),
+          ],
+          flags: COMPONENTS_V2,
+          });
+        } catch (error) {
+          console.error(`[ACTION] Could not notify user ${caseData.user_id}:`, error);
+        }
+      }
+
+      if (caseData.message_id && caseData.channel_id) {
+        try {
+          const caseLogChannel = await interaction.client.channels.fetch(
+            caseData.channel_id,
+          );
+          const caseMessage = await caseLogChannel.messages.fetch(caseData.message_id);
+          const caseNumber = await getCaseNumber(caseData);
+          const container = createCaseContainer(
+            { ...caseData, case_number: caseNumber },
+            statusText,
+            color,
+            {
+              status: statusText,
+              handledBy: interaction.user.username,
+              staffReason: reason,
+              openerAvatarUrl,
+              botUsername: interaction.client.user.username,
+            },
+          );
+
+          await caseMessage.edit({
+            embeds: [],
+            components: [container],
+            flags: COMPONENTS_V2,
+          });
+        } catch (error) {
+          console.error(`[ACTION] Could not update case message ${caseId}:`, error);
+        }
+      }
+
+      await interaction.editReply({
+        components: [
+          createContainer(color, [
+            `### Case ${caseId} ${statusText.toLowerCase()}`,
+            `Handled by <@${interaction.user.id}>.`,
+          ]),
+        ],
+        flags: COMPONENTS_V2,
+      });
+    } catch (error) {
+      console.error('Error handling case action:', error);
+      await interaction.editReply({
+        components: [
+          createContainer(0xFF0000, [
+            `### Case Action Failed`,
+            `An error occurred while processing the case action.`,
+          ]),
+        ],
+        flags: COMPONENTS_V2,
+      });
+    }
+  },
 };

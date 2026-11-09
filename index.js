@@ -9,10 +9,26 @@ const {
   REST,
   Routes,
   ActivityType,
+  ContainerBuilder,
+  MessageFlags,
   PresenceUpdateStatus,
+  TextDisplayBuilder,
 } = require('discord.js');
 
-const requiredEnv = ['DISCORD_TOKEN', 'CLIENT_ID', 'GUILD_ID'];
+const COMPONENTS_V2 = MessageFlags.IsComponentsV2;
+const EPHEMERAL_V2 = MessageFlags.Ephemeral | COMPONENTS_V2;
+
+function createErrorContainer() {
+  return new ContainerBuilder()
+    .setAccentColor(0xFF0000)
+    .addTextDisplayComponents(
+      new TextDisplayBuilder().setContent(
+        '# Command Failed\nThere was an error while running this command.',
+      ),
+    );
+}
+
+const requiredEnv = ['DISCORD_TOKEN', 'CLIENT_ID', 'GUILD_ID', 'DATABASE_URL'];
 
 for (const key of requiredEnv) {
   if (!process.env[key]) {
@@ -74,30 +90,18 @@ async function registerCommands() {
 
 client.once('clientReady', () => {
   console.log(`Logged in as ${client.user.tag}`);
-  
-  // Anti-timeout: Update bot status every 5 minutes
-  setInterval(() => {
-    client.user.setPresence({
-      status: PresenceUpdateStatus.Online,
-      activities: [
-        {
-          name: 'Appeals | /deploy',
-          type: ActivityType.Watching,
-        },
-      ],
-    });
-    console.log('[ANTI-TIMEOUT] Updated bot status');
-  }, 5 * 60 * 1000); // Every 5 minutes
-
-  // Initial presence setup
-  client.user.setPresence({
-    status: PresenceUpdateStatus.Online,
+    
+  client.user.setStatus({
+    status: PresenceUpdateStatus.Custom,
     activities: [
       {
-        name: 'Appeals | /deploy',
-        type: ActivityType.Watching,
+        name: 'FSGIA Manager',
+        type: ActivityType.Playing,
+        text: 'Handling Appeals ',
       },
     ],
+    
+   
   });
 });
 
@@ -117,44 +121,22 @@ client.on('interactionCreate', async interaction => {
     console.error(error);
 
     const reply = {
-      content: 'There was an error while running this command.',
-      ephemeral: true,
+      components: [createErrorContainer()],
+      flags: EPHEMERAL_V2,
     };
 
-    if (interaction.replied || interaction.deferred) {
+    if (interaction.deferred) {
+      await interaction.editReply({
+        components: [createErrorContainer()],
+        flags: COMPONENTS_V2,
+      });
+    } else if (interaction.replied) {
       await interaction.followUp(reply);
     } else {
       await interaction.reply(reply);
     }
   }
 });
-
-// Anti-timeout: Handle disconnections and auto-reconnect
-client.on('disconnect', () => {
-  console.warn('[ANTI-TIMEOUT] Bot disconnected, attempting to reconnect...');
-});
-
-client.on('error', (error) => {
-  console.error('[ERROR]', error);
-});
-
-client.on('warn', (info) => {
-  console.warn('[WARNING]', info);
-});
-
-// Heartbeat monitor
-let lastHeartbeat = Date.now();
-client.on('shardHeartbeatAck', () => {
-  lastHeartbeat = Date.now();
-});
-
-// Check heartbeat every 30 seconds
-setInterval(() => {
-  const now = Date.now();
-  if (now - lastHeartbeat > 60000) {
-    console.warn('[ANTI-TIMEOUT] No heartbeat received in 60 seconds, connection may be stale');
-  }
-}, 30000);
 
 async function startBot() {
   let attempt = 0;
@@ -163,7 +145,7 @@ async function startBot() {
 
   while (attempt < maxAttempts) {
     try {
-      console.log(`[ANTI-TIMEOUT] Starting bot (attempt ${attempt + 1}/${maxAttempts})...`);
+      
       await registerCommands();
       await client.login(process.env.DISCORD_TOKEN);
       break; // Success, exit loop
